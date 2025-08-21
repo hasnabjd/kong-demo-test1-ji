@@ -1,0 +1,118 @@
+name: Build kong-demo_test1-ji flight-service API - Generate Kong Configs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/*
+      - main
+    paths:
+      - 'kong-demo-test1-ji/flight-service/openapi.yaml'
+      - 'kong-demo-test1-ji/flight-service/kong/**'
+      - 'kong-demo-test1-ji/kong/plugins/**'
+      - 'kong-demo-test1-ji/kong/consumers/**'
+      - '.github/workflows/build-flight-service.yaml'
+
+jobs:
+  oas-to-kong:
+    name: Convert OAS to Kong configurations
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup deck
+        uses: kong/setup-deck@v1
+        with:
+          deck-version: '1.40.3'
+          wrapper: false
+
+      - name: Generate Kong Declarative Configs from OpenAPI
+        run: |
+          deck file openapi2kong \
+            --spec kong-demo-test1-ji/flight-service/openapi.yaml \
+            --output-file kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml
+
+      - name: Merge global plugins
+        run: |
+          deck file merge kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml \
+            kong-demo-test1-ji/kong/plugins/*.yaml \
+            --output-file kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml
+
+      - name: Merge service-specific plugins
+        run: |
+          deck file merge kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml \
+            kong-demo-test1-ji/flight-service/kong/plugins/*.yaml \
+            --output-file kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml
+
+      - name: Merge global consumers
+        run: |
+          deck file merge kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml \
+            kong-demo-test1-ji/kong/consumers/*.yaml \
+            --output-file kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml
+
+      - name: Merge service-specific consumers
+        run: |
+          deck file merge kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml \
+            kong-demo-test1-ji/flight-service/kong/consumers/*.yaml \
+            --output-file kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml
+
+      - name: Add tags
+        run: |
+          cat demo_test1-ji/flight-service/kong/.generated/kong.yaml | \
+          deck file add-tags demo_test1_ji flight-service \
+          --selector "$.services[*]" \
+          --selector "$.services[*].routes[*]"  \
+          --selector "$.consumers[*]" \
+          --output-file demo_test1-ji/flight-service/kong/.generated/kong.yaml
+
+      - name: Apply environment-specific patches
+        run: |
+          if [ -f "kong-demo-test1-ji/flight-service/kong/patches.yaml" ]; then
+            deck file patch kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml \
+              kong-demo-test1-ji/flight-service/kong/patches.yaml \
+              --output-file kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml
+          else
+            echo "No patches.yaml found, skipping patch step"
+          fi
+
+      - name: Validate decK state file locally
+        run: |
+          deck file validate kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml
+
+      - name: Copy to artifact directory
+        run: |
+          mkdir -p .github/artifacts/kong-demo-test1-ji/flight-service/ 
+          cp kong-demo-test1-ji/flight-service/kong/.generated/kong.yaml \
+             .github/artifacts/kong-demo-test1-ji/flight-service/kong-demo-test1-ji-flight-service-kong.yaml
+
+      - name: Validate connectivity to Konnect
+        run: |
+          deck gateway ping \
+            --konnect-control-plane-name ${{vars.KONNECT_INTERNAL_CP}} \
+            --konnect-token ${{ secrets.KONNECT_PAT }} \
+            --konnect-addr ${{vars.KONNECT_ADDR}}
+
+      - name: deck diff
+        id: deck-diff
+        run: |
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "DIFF<<$EOF" >> $GITHUB_ENV
+          deck gateway diff \
+            --select-tag demo_test1_ji \
+            --select-tag flight-service \
+            .github/artifacts/kong-demo_test1-ji/flight-service/demo_test1-ji-flight-service-kong.yaml \
+            --konnect-control-plane-name ${{vars.KONNECT_INTERNAL_CP}} \
+            --konnect-token ${{ secrets.KONNECT_PAT }} \
+            --konnect-addr ${{vars.KONNECT_ADDR}} >> $GITHUB_ENV
+          echo "$EOF" >> $GITHUB_ENV
+
+      - name: Check status of any files to be committed
+        run: git status
+
+      - name: Create PR to stage changes for the Kong Gateway in production
+        uses: peter-evans/create-pull-request@v5
+        with:
+          title: "❗PRD❗: Staged changes for Kong Gateway PRD deployment - demo_test1-ji flight-service"
+          labels: "PRD,kong,demo_test1-ji,flight-service"
+          body: "Merging this PR will result in the following changes deployed to PRD \n\n ```\n${{env.DIFF}}\n```"
